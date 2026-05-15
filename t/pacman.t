@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 22;
+use Test::More tests => 30;
 use File::Temp qw(tempdir);
 use Cwd;
 
@@ -88,3 +88,51 @@ ok(defined $pkg->postinst && $pkg->postinst =~ /installed/,
    '.INSTALL post_install body transcribed');
 ok(defined $pkg->prerm && $pkg->prerm =~ /removing/,
    '.INSTALL pre_remove body transcribed');
+
+# =========================================================================
+# build() round-trip tests
+# =========================================================================
+
+{
+# Build a package from synthetic object state.
+my $builddir = tempdir("alien-build-XXXX", CLEANUP => 1, TMPDIR => 1);
+system("mkdir -p '$builddir/usr/bin'") == 0 or die "mkdir usr/bin failed";
+system("mkdir -p '$builddir/etc'") == 0 or die "mkdir etc failed";
+open my $fh2, '>', "$builddir/usr/bin/testpkg" or die;
+print $fh2 "#!/bin/sh\necho hello\n";
+close $fh2;
+open $fh2, '>', "$builddir/etc/foo.conf" or die;
+print $fh2 "config=true\n";
+close $fh2;
+
+my $builder = Alien::Package::Pacman->new();
+$builder->name('testpkg');
+$builder->version('1.2.3');
+$builder->release('2');
+$builder->arch('amd64');
+$builder->summary('A test package');
+$builder->copyright('GPL-3.0-or-later');
+$builder->maintainer('Test User <test@example.com>');
+$builder->depends('glibc>=2.38, perl>=5.0');
+$builder->provides('testpkg');
+$builder->buildtree($builddir);
+
+my $save_cwd2 = Cwd::cwd();
+chdir $tmpdir;
+my $built_file = $builder->build();
+chdir $save_cwd2;
+
+ok(defined $built_file, 'build() returned a filename');
+ok(-f "$tmpdir/$built_file", 'built package file exists');
+ok(-s "$tmpdir/$built_file" > 0, 'built package has nonzero size');
+
+# Re-read the built file through a fresh scan.
+my $re_read = Alien::Package::Pacman->new(filename => "$tmpdir/$built_file");
+is($re_read->name,       'testpkg',           'round-trip name');
+is($re_read->version,    '1.2.3',             'round-trip version');
+is($re_read->arch,       'amd64',             'round-trip arch');
+is($re_read->summary,    'A test package',    'round-trip summary');
+
+my $re_files = $re_read->filelist;
+is(scalar @{$re_files}, 2, 'round-trip file count');
+}

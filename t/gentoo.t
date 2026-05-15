@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 20;
+use Test::More tests => 29;
 use File::Temp qw(tempdir);
 use Cwd;
 
@@ -72,3 +72,46 @@ ok((grep { m|/usr/bin/testgentoo$| } @{$files}),
    'filelist includes /usr/bin/testgentoo');
 ok((grep { m|/etc/testgentoo/config$| } @{$files}),
    'filelist includes /etc/testgentoo/config');
+
+# =========================================================================
+# build() round-trip tests
+# =========================================================================
+
+{
+# Build a package from synthetic object state.
+my $builddir = tempdir("alien-build-XXXX", CLEANUP => 1, TMPDIR => 1);
+system("mkdir -p '$builddir/usr/bin'") == 0 or die "mkdir usr/bin failed";
+open my $fh2, '>', "$builddir/usr/bin/testapp" or die;
+print $fh2 "#!/bin/sh\necho built\n";
+close $fh2;
+
+my $builder = Alien::Package::Gentoo->new();
+$builder->name('testgentoo');
+$builder->version('1.0');
+$builder->arch('amd64');
+$builder->summary('Round-trip test package');
+$builder->description('Round-trip test package');
+$builder->copyright('GPL-3');
+$builder->group('app-misc');
+$builder->depends('dev-libs/foo');
+$builder->provides('virtual/testgentoo');
+$builder->buildtree($builddir);
+
+my $save_cwd2 = Cwd::cwd();
+chdir $tmpdir;
+my $built_file = $builder->build();
+chdir $save_cwd2;
+
+ok(defined $built_file, 'build() returned a filename');
+ok(-f "$tmpdir/$built_file", 'built .gpkg.tar exists');
+ok(-s "$tmpdir/$built_file" > 0, 'built .gpkg.tar has nonzero size');
+
+# Re-read the built file through a fresh scan.
+my $re_read = Alien::Package::Gentoo->new(filename => "$tmpdir/$built_file");
+is($re_read->name,      'testgentoo',        'round-trip name');
+is($re_read->version,   '1.0',               'round-trip version');
+is($re_read->arch,      'amd64',             'round-trip arch');
+is($re_read->summary,   'Round-trip test package',   'round-trip summary');
+is($re_read->copyright, 'GPL-3',             'round-trip copyright');
+is($re_read->group,     'app-misc',          'round-trip group');
+}
