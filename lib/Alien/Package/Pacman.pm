@@ -78,8 +78,175 @@ from inside the tar and populates the alien internal field representation.
 sub scan {
 	my $this=shift;
 	$this->SUPER::scan(@_);
+	my $file=$this->filename;
 
-	die "TODO: Alien::Package::Pacman::scan not yet implemented; see nlspec/alien-rewrite.md";
+	# Extract .PKGINFO from the tar.
+	my @pkginfo=$this->runpipe(1, "tar -xOf '$file' .PKGINFO 2>/dev/null");
+	die "No .PKGINFO found in '$file'; not a valid pacman package"
+		if !@pkginfo;
+
+	# Parse .PKGINFO key = value lines.
+	my %fields;
+	my (@depend, @conflict, @provides, @replaces);
+	foreach my $line (@pkginfo) {
+		chomp $line;
+		next if $line =~ /^\s*#/ || $line =~ /^\s*$/;
+		if ($line =~ /^\s*(\w+)\s*=\s*(.*?)\s*$/) {
+			my $key = $1;
+			my $value = $2;
+			if ($key eq 'depend')    { push @depend,    $value; }
+			elsif ($key eq 'conflict')  { push @conflict,  $value; }
+			elsif ($key eq 'provides')  { push @provides,  $value; }
+			elsif ($key eq 'replaces')  { push @replaces,  $value; }
+			else                        { $fields{$key}    = $value; }
+		}
+	}
+
+	die "Missing 'pkgname' in .PKGINFO from '$file'"
+		unless exists $fields{pkgname};
+	die "Missing 'pkgver' in .PKGINFO from '$file'"
+		unless exists $fields{pkgver};
+
+	# pkgver format: version-release (e.g. "2.12.1-1")
+	my $pkgver = $fields{pkgver};
+	if ($pkgver =~ /^(.+)-([^-]+)$/) {
+		$this->version($1);
+		$this->release($2);
+	}
+	else {
+		$this->version($pkgver);
+		$this->release(1);
+	}
+
+	$this->name($fields{pkgname});
+	$this->arch($this->_translate_arch($fields{arch}))
+		if exists $fields{arch};
+	$this->summary($fields{pkgdesc})
+		if exists $fields{pkgdesc};
+	$this->description($fields{pkgdesc})
+		if exists $fields{pkgdesc};
+	$this->maintainer($fields{packager})
+		if exists $fields{packager};
+	$this->copyright($fields{license})
+		if exists $fields{license};
+	$this->group($fields{group})
+		if exists $fields{group};
+
+	$this->depends(join(", ", @depend))   if @depend;
+	$this->conflicts(join(", ", @conflict))  if @conflict;
+	$this->provides(join(", ", @provides))  if @provides;
+	$this->replaces(join(", ", @replaces))  if @replaces;
+
+	# Enumumerate package files: skip directories and root metadata files.
+	my @tar_files = $this->runpipe(0, "tar -tf '$file' 2>/dev/null");
+	chomp @tar_files;
+	my @filelist;
+	foreach my $f (@tar_files) {
+		chomp $f;
+		next if $f =~ m|/$|;                # skip directories
+		next if $f =~ /^\.[^\/]/;           # skip root metadata (.PKGINFO, .INSTALL, .MTREE)
+		push @filelist, "/$f";
+	}
+	$this->filelist(\@filelist) if @filelist;
+
+	# Extract .INSTALL hook script if present.
+	my $install_script = $this->runpipe(1,
+		"tar -xOf '$file' .INSTALL 2>/dev/null");
+	if (defined $install_script && length $install_script) {
+		$this->_parse_install_script($install_script);
+	}
+
+	$this->origformat('pacman');
+	$this->distribution('Arch Linux');
+
+	return 1;
+}
+
+=item _translate_arch
+
+Map pacman architecture to the Debian-internal naming used by Alien.
+
+=cut
+
+sub _translate_arch {
+	my $this=shift;
+	my $arch=shift;
+	return unless defined $arch;
+
+	my %map = (
+		x86_64  => 'amd64',
+		i386    => 'i386',
+		i486    => 'i386',
+		i586    => 'i386',
+		i686    => 'i386',
+		aarch64 => 'arm64',
+		armv6h  => 'armhf',
+		armv7h  => 'armhf',
+		any     => 'all',
+		noarch  => 'all',
+	);
+	return $map{$arch} if exists $map{$arch};
+	return $arch; # passthrough unknown
+}
+
+=item _parse_install_script
+
+Parse an .INSTALL shell script, extracting hook function bodies.
+Transcribes as text — never executes.
+
+Known hooks:
+  post_install  -> postinst
+  pre_upgrade   -> preinst
+  post_upgrade  -> postinst
+  pre_remove    -> prerm
+  post_remove   -> postrm
+
+=cut
+
+sub _parse_install_script {
+	my $this=shift;
+	my $script=shift;
+	return unless defined $script && length $script;
+
+	my %hooks;
+	my %hook_map = (
+		post_install  => 'postinst',
+		pre_upgrade   => 'preinst',
+		post_upgrade  => 'postinst',
+		pre_remove    => 'prerm',
+		post_remove   => 'postrm',
+	);
+
+	foreach my $hook_name (keys %hook_map) {
+		if ($script =~ /^\s*\Q$hook_name\E\s*\(\s*\)\s*\{/m) {
+			# Locate the opening brace.
+			my $brace = index($script, '{', $-[0]);
+			# Find the matching closing brace.
+			my $depth = 1;
+			my $pos   = $brace + 1;
+			while ($depth > 0 && $pos < length($script)) {
+				my $ch = substr($script, $pos, 1);
+				$depth++ if $ch eq '{';
+				$depth-- if $ch eq '}';
+				$pos++;
+			}
+			my $body = substr($script, $brace + 1, $pos - $brace - 2);
+			$body =~ s/^\s+|\s+$//g;
+			$hooks{$hook_name} = $body if length $body;
+		}
+	}
+
+	# Concatenate hooks that map to the same alien field.
+	foreach my $hook_name (keys %hooks) {
+		my $field    = $hook_map{$hook_name};
+		my $existing = $this->$field() || '';
+		if (length $existing) {
+			$this->$field($existing . "\n\n" . $hooks{$hook_name});
+		}
+		else {
+			$this->$field($hooks{$hook_name});
+		}
+	}
 }
 
 =item unpack
