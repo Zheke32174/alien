@@ -10,6 +10,9 @@ package Alien::Package::Gentoo;
 use strict;
 use base qw(Alien::Package);
 use File::Temp qw(tempdir);
+use File::Find;
+use Digest::MD5;
+use Digest::SHA;
 
 =head1 DESCRIPTION
 
@@ -479,10 +482,251 @@ may be supported in a later phase.
 
 =cut
 
+=item _reverse_translate_chost
+
+Map Debian-internal architecture naming back to a Gentoo CHOST triplet.
+Inverse of _translate_chost.
+
+=cut
+
+sub _reverse_translate_chost {
+	my $this=shift;
+	my $arch=shift;
+	return unless defined $arch;
+
+	my %map = (
+		amd64   => 'x86_64-pc-linux-gnu',
+		i386    => 'i686-pc-linux-gnu',
+		arm64   => 'aarch64-unknown-linux-gnu',
+		armhf   => 'armv7a-unknown-linux-gnueabihf',
+		armel   => 'armv7a-unknown-linux-gnueabi',
+		powerpc => 'powerpc-unknown-linux-gnu',
+		ppc64   => 'powerpc64-unknown-linux-gnu',
+		ppc64el => 'powerpc64le-unknown-linux-gnu',
+		all     => 'x86_64-pc-linux-gnu',
+	);
+	return exists $map{$arch} ? $map{$arch} : 'x86_64-pc-linux-gnu';
+}
+
+=item _emit_contents
+
+Generate a Gentoo CONTENTS file from a directory tree.
+
+Returns multi-line string in standard Gentoo format:
+  obj /path md5sum mtime
+  dir /path
+  sym /path -> /target mtime
+
+Skips metadata files (.PKGINFO, .INSTALL, .MTREE).
+
+=cut
+
+sub _emit_contents {
+	my $this=shift;
+	my $tree=shift;
+	return '' unless defined $tree && -d $tree;
+
+	$tree =~ s{/*$}{};  # strip trailing slashes
+	my $contents   = '';
+	my $root_len   = length($tree);
+	find({
+		wanted => sub {
+			return if $File::Find::name eq $tree;  # skip root dir
+			my $rel = substr($File::Find::name, $root_len + 1);
+			return unless defined $rel && length $rel;
+
+			# Skip metadata files at root
+			return if $rel =~ m{^\.(PKGINFO|INSTALL|MTREE)$};
+
+			my @st  = stat($_);
+			my $mtime = $st[9];
+
+			if (-l $_) {
+				my $target = readlink($_);
+				$contents .= "sym /$rel -> $target $mtime\n";
+			}
+			elsif (-f $_) {
+				open my $fh, '<:raw', $_ or return;
+				my $md5 = Digest::MD5->new->addfile($fh)->hexdigest;
+				close $fh;
+				$contents .= "obj /$rel $md5 $mtime\n";
+			}
+			elsif (-d _) {
+				$contents .= "dir /$rel\n";
+			}
+		},
+		no_chdir => 1,
+	}, $tree);
+
+	return $contents;
+}
+
+=item _sha256_file
+
+Compute SHA-256 hex digest of a file. Used for Manifest generation.
+
+=cut
+
+sub _sha256_file {
+	my $file=shift;
+	open my $fh, '<:raw', $file or die "open $file: $!";
+	my $digest = Digest::SHA->new(256)->addfile($fh)->hexdigest;
+	close $fh;
+	return $digest;
+}
+
+=item build
+
+Build a Gentoo binary package from the prepped tree.
+
+Emits .gpkg.tar (GLEP 78 modern format) only — legacy .tbz2 emit is
+deferred to Phase 4 (too fiddly for the binary XPAK trailer math).
+
+Returns the filename of the generated package.
+
+=cut
+
 sub build {
 	my $this=shift;
 
-	die "TODO: Alien::Package::Gentoo::build not yet implemented; see nlspec/alien-rewrite.md";
+	my $buildtree = $this->buildtree;
+	die "buildtree not set" unless defined $buildtree && -d $buildtree;
+
+	my $name    = $this->name;
+	my $version = $this->version;
+	defined $name    or die "name is required";
+	defined $version or die "version is required";
+
+	# Determine PF and PR
+	my $release_raw = $this->release;
+	my $pr;
+	my $pf_release = '';
+
+	if (!defined $release_raw || $release_raw eq '1'
+		|| (!
+			ref($release_raw) && $release_raw == 1))
+	{
+		$pr = 'r0';
+	}
+	elsif ($release_raw =~ /^r(\d+)$/) {
+		$pr         = $release_raw;
+		$pf_release = "-$release_raw" if $1 > 0;
+	}
+	else {
+		$pr         = "r${release_raw}";
+		$pf_release = "-r${release_raw}";
+	}
+
+	my $pf     = $name . '-' . $version . $pf_release;
+	my $output = "${pf}.gpkg.tar";
+
+	my $staging  = tempdir("alien-gpkg-XXXX", CLEANUP => 1, TMPDIR => 1);
+	my $metadir  = "$staging/metadata";
+	mkdir($metadir) or die "mkdir $metadir: $!";
+
+	# --- Write metadata files ---
+	my @metadata;
+	push @metadata, ['PF',         $pf];
+	push @metadata, ['PN',         $name];
+	push @metadata, ['PV',         $version];
+	push @metadata, ['PR',         $pr];
+	push @metadata, ['CATEGORY',   $this->group || 'app-misc'];
+	my $desc = $this->description || $this->summary;
+	push @metadata, ['DESCRIPTION', $desc] if defined $desc;
+	push @metadata, ['LICENSE',    $this->copyright] if defined $this->copyright;
+	push @metadata, ['CHOST',      $this->_reverse_translate_chost($this->arch)];
+	my $homepage = $this->url;
+	push @metadata, ['HOMEPAGE',   $homepage] if defined $homepage;
+
+	# Dependencies: depends in gentoo style (space-separated)
+	my $depends = $this->depends;
+	if (defined $depends) {
+		my @deps = split(/, ?/, $depends);
+		my $dep_str = join(' ', @deps);
+		push @metadata, ['DEPEND',   $dep_str] if length $dep_str;
+		push @metadata, ['RDEPEND',  $dep_str] if length $dep_str;
+	}
+
+	# Provides
+	my $provides = $this->provides;
+	if (defined $provides) {
+		my @prov = split(/, ?/, $provides);
+		push @metadata, ['PROVIDE', join(' ', @prov)];
+	}
+
+	foreach my $pair (@metadata) {
+		my ($key, $value) = @$pair;
+		next unless defined $value;
+		open my $fh, '>', "$metadir/$key"
+			or die "$metadir/$key: $!";
+		print $fh "$value\n";
+		close $fh;
+	}
+
+	# --- Generate CONTENTS from buildtree ---
+	my $contents = $this->_emit_contents($buildtree);
+	if (length $contents) {
+		open my $fh, '>', "$metadir/CONTENTS"
+			or die "$metadir/CONTENTS: $!";
+		print $fh $contents;
+		close $fh;
+	}
+
+	# --- Create metadata.tar.gz ---
+	opendir(my $dh, $metadir) or die "opendir $metadir: $!";
+	my @meta_entries = sort grep { !/^\.\.?$/ } readdir($dh);
+	closedir $dh;
+
+	my $meta_tar = "$staging/metadata.tar.gz";
+	$this->do("tar", "-czf", $meta_tar, "-C", $metadir, @meta_entries)
+		or die "Failed to create metadata.tar.gz";
+	die "metadata.tar.gz not created" unless -f $meta_tar;
+
+	# --- Create image.tar.gz from buildtree ---
+	opendir($dh, $buildtree) or die "opendir $buildtree: $!";
+	my @img_entries = sort grep {
+		!/^\.\.?$/ && !/^\.(PKGINFO|INSTALL|MTREE)$/
+	} readdir($dh);
+	closedir $dh;
+
+	my $img_tar = "$staging/image.tar.gz";
+	if (@img_entries) {
+		$this->do("tar", "-czf", $img_tar, "-C", $buildtree,
+			@img_entries)
+			or die "Failed to create image.tar.gz";
+	}
+	else {
+		# Create minimal empty image tar
+		$this->do("tar", "-czf", $img_tar,
+			"--files-from", "/dev/null")
+			or die "Failed to create empty image.tar.gz";
+	}
+	die "image.tar.gz not created" unless -f $img_tar;
+
+	# --- Create Manifest ---
+	my $manifest = "$staging/Manifest";
+	open my $mfh, '>', $manifest or die "$manifest: $!";
+
+	my $meta_size = -s $meta_tar;
+	my $meta_sha  = _sha256_file($meta_tar);
+	print $mfh "DATA metadata.tar.gz $meta_size $meta_sha\n";
+
+	my $img_size = -s $img_tar;
+	my $img_sha  = _sha256_file($img_tar);
+	print $mfh "DATA image.tar.gz $img_size $img_sha\n";
+	close $mfh;
+
+	# --- Build outer .gpkg.tar ---
+	my $outer_tar_ok = $this->do("tar", "-cf",
+		Cwd::abs_path($output), "-C", $staging,
+		'metadata.tar.gz', 'image.tar.gz', 'Manifest');
+	die "Failed to create $output" unless $outer_tar_ok;
+
+	# Validate
+	die "Package file '$output' was not created" unless -f $output;
+	die "Package file '$output' has zero size"    unless -s $output;
+
+	return $output;
 }
 
 =item cleantree
