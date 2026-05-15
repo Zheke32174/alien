@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 29;
+use Test::More tests => 36;
 use File::Temp qw(tempdir);
 use Cwd;
 
@@ -38,8 +38,17 @@ chdir $tmpdir;
 my $ret = system("tar -czf metadata.tar.gz -C '$metadir' . 2>/dev/null");
 ok($ret == 0, "metadata.tar.gz created");
 
-# Create a minimal image.tar.gz.
+# Create a minimal image.tar.gz with test files.
 mkdir("$tmpdir/image") unless -d "$tmpdir/image";
+mkdir("$tmpdir/image/usr")     unless -d "$tmpdir/image/usr";
+mkdir("$tmpdir/image/usr/bin") unless -d "$tmpdir/image/usr/bin";
+open my $ifh, '>', "$tmpdir/image/usr/bin/testgentoo" or die;
+print $ifh "#!/bin/sh\necho hello\n";
+close $ifh;
+mkdir("$tmpdir/image/etc") unless -d "$tmpdir/image/etc";
+open $ifh, '>', "$tmpdir/image/etc/gentoo.conf" or die;
+print $ifh "config=yes\n";
+close $ifh;
 $ret = system("tar -czf image.tar.gz -C '$tmpdir/image' . 2>/dev/null");
 ok($ret == 0, "image.tar.gz created");
 
@@ -76,6 +85,9 @@ ok((grep { m|/etc/testgentoo/config$| } @{$files}),
 # =========================================================================
 # build() round-trip tests
 # =========================================================================
+
+# Back up the fixture before build round-trip (build() may overwrite it).
+system("cp -a '$test_file' '$test_file.bak'") == 0 or die "backup failed";
 
 {
 # Build a package from synthetic object state.
@@ -114,4 +126,41 @@ is($re_read->arch,      'amd64',             'round-trip arch');
 is($re_read->summary,   'Round-trip test package',   'round-trip summary');
 is($re_read->copyright, 'GPL-3',             'round-trip copyright');
 is($re_read->group,     'app-misc',          'round-trip group');
+}
+
+# Restore the fixture file from backup.
+system("cp -a '$test_file.bak' '$test_file'") == 0 or die "restore failed";
+
+# =========================================================================
+# Phase 4: test(), unpack(), install() smoke tests
+# =========================================================================
+
+{
+# test() — container integrity + metadata sanity.
+my $result = $pkg->test;
+ok(defined $result, 'test() returns success');
+}
+
+{
+# unpack() — extract image into buildtree.
+my $unpackdir = $pkg->unpack;
+ok(defined $unpackdir,     'unpack() returns a directory');
+ok(-d $unpackdir,          'unpack directory exists');
+ok(-f "$unpackdir/usr/bin/testgentoo",  'unpacked /usr/bin/testgentoo');
+ok(-f "$unpackdir/etc/gentoo.conf",     'unpacked /etc/gentoo.conf');
+}
+
+{
+# install() — mock do() to capture the command.
+my $captured;
+local *Alien::Package::do = sub {
+	my $self = shift;
+	$captured = join(' ', @_);
+	return 1;
+};
+local *Alien::Package::Gentoo::_inpath = sub { return 1 };
+my $install_pkg = Alien::Package::Gentoo->new();
+$install_pkg->install($test_file);
+like($captured, qr/emerge/,            'install() calls emerge');
+like($captured, qr/\Q$test_file\E/,    'install() includes filename');
 }

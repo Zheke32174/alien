@@ -51,11 +51,30 @@ package to install.
 
 =cut
 
+sub _inpath {
+	my $this=shift;
+	my $program=shift;
+
+	foreach (split(/:/,$ENV{PATH})) {
+		return 1 if -x "$_/$program";
+	}
+	return '';
+}
+
 sub install {
 	my $this=shift;
 	my $file=shift;
 
-	die "TODO: Alien::Package::Pacman::install not yet implemented; see nlspec/alien-rewrite.md";
+	die "install requires pacman on PATH; this is a feature of Arch-based systems"
+		unless $this->_inpath('pacman');
+
+	my $v=$Alien::Package::verbose;
+	$Alien::Package::verbose=2;
+	$this->do("pacman", "-U", "--noconfirm", $file)
+		or die "Unable to install";
+	$Alien::Package::verbose=$v;
+
+	return 1;
 }
 
 =item test
@@ -66,9 +85,22 @@ Test a pacman package. Pass in the filename of the package to test.
 
 sub test {
 	my $this=shift;
-	my $file=shift;
+	my $file=shift || $this->filename;
+	return unless defined $file;
 
-	die "TODO: Alien::Package::Pacman::test not yet implemented; see nlspec/alien-rewrite.md";
+	# Container integrity check.
+	$this->do("tar", "-tf", $file)
+		or do { warn "Integrity check failed for '$file'\n"; return; };
+
+	# Metadata sanity: scan into a fresh object and verify required fields.
+	my $scanner = Alien::Package::Pacman->new(filename => $file);
+	unless (defined $scanner->name && defined $scanner->version) {
+		warn "Metadata check failed for '$file': missing name or version\n";
+		return;
+	}
+
+	print "OK\n";
+	return 1;
 }
 
 =item scan
@@ -261,8 +293,32 @@ Unpack a pacman package into a temporary directory.
 sub unpack {
 	my $this=shift;
 	$this->SUPER::unpack(@_);
+	my $file=$this->filename;
 
-	die "TODO: Alien::Package::Pacman::unpack not yet implemented; see nlspec/alien-rewrite.md";
+	# Set buildtree to a tempdir (absolute path) if not already set.
+	unless ($this->buildtree) {
+		my $dir = tempdir("alien-pacman-unpack-XXXX",
+			CLEANUP => 1, TMPDIR => 1);
+		$this->buildtree($dir);
+	}
+	my $buildtree=$this->buildtree;
+
+	# Determine compression flag from filename.
+	my @tar_opts;
+	if    ($file =~ /\.zst$/)  { @tar_opts = ('--zstd'); }
+	elsif ($file =~ /\.xz$/)   { @tar_opts = ('-J'); }
+	elsif ($file =~ /\.gz$/)   { @tar_opts = ('-z'); }
+	elsif ($file =~ /\.bz2$/)  { @tar_opts = ('-j'); }
+
+	# Extract everything EXCEPT root metadata files (.PKGINFO, .INSTALL, .MTREE).
+	$this->do("tar", @tar_opts, "-xf", $file,
+		"-C", $buildtree,
+		"--exclude", ".PKGINFO",
+		"--exclude", ".INSTALL",
+		"--exclude", ".MTREE")
+		or die "Unpacking of '$file' failed: $!";
+
+	return $buildtree;
 }
 
 =item prep
@@ -275,7 +331,14 @@ unpacked tree.
 sub prep {
 	my $this=shift;
 
-	die "TODO: Alien::Package::Pacman::prep not yet implemented; see nlspec/alien-rewrite.md";
+	# Use base class behavior. If buildtree is not yet set and we have a
+	# filename, populate buildtree by unpacking.
+	if (!$this->buildtree && $this->filename) {
+		$this->unpack;
+	}
+	else {
+		$this->SUPER::prep(@_);
+	}
 }
 
 =item build
@@ -441,7 +504,8 @@ had on it.
 sub cleantree {
 	my $this=shift;
 
-	die "TODO: Alien::Package::Pacman::cleantree not yet implemented; see nlspec/alien-rewrite.md";
+	# Defer to base class (removes unpacked_tree / buildtree if applicable).
+	$this->SUPER::cleantree(@_);
 }
 
 =back
