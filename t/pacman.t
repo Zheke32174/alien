@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 30;
+use Test::More tests => 38;
 use File::Temp qw(tempdir);
 use Cwd;
 
@@ -135,4 +135,39 @@ is($re_read->summary,    'A test package',    'round-trip summary');
 
 my $re_files = $re_read->filelist;
 is(scalar @{$re_files}, 2, 'round-trip file count');
+}
+
+# =========================================================================
+# Phase 4: test(), unpack(), install() smoke tests
+# =========================================================================
+
+{
+# test() — container integrity + metadata sanity.
+my $result = $pkg->test;
+ok(defined $result, 'test() returns success');
+}
+
+{
+# unpack() — extract files into buildtree, skip metadata.
+my $unpackdir = $pkg->unpack;
+ok(defined $unpackdir,  'unpack() returns a directory');
+ok(-d $unpackdir,       'unpack directory exists');
+ok(-f "$unpackdir/etc/foo.conf",     'unpacked /etc/foo.conf');
+ok(-f "$unpackdir/usr/bin/testpkg",  'unpacked /usr/bin/testpkg');
+ok(!-f "$unpackdir/.PKGINFO",        'unpacked excludes .PKGINFO (metadata)');
+}
+
+{
+# install() — mock do() to capture the command.
+my $captured;
+local *Alien::Package::do = sub {
+	my $self = shift;
+	$captured = join(' ', @_);
+	return 1;
+};
+local *Alien::Package::Pacman::_inpath = sub { return 1 };
+my $install_pkg = Alien::Package::Pacman->new();
+$install_pkg->install($test_file);
+like($captured, qr/pacman -U/,           'install() calls pacman -U');
+like($captured, qr/\Q$test_file\E/,      'install() includes filename');
 }

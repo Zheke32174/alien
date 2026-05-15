@@ -50,11 +50,30 @@ Install a Gentoo binary package with emerge. Pass in the filename.
 
 =cut
 
+sub _inpath {
+	my $this=shift;
+	my $program=shift;
+
+	foreach (split(/:/,$ENV{PATH})) {
+		return 1 if -x "$_/$program";
+	}
+	return '';
+}
+
 sub install {
 	my $this=shift;
 	my $file=shift;
 
-	die "TODO: Alien::Package::Gentoo::install not yet implemented; see nlspec/alien-rewrite.md";
+	die "install requires emerge on PATH; this is a feature of Gentoo systems"
+		unless $this->_inpath('emerge');
+
+	my $v=$Alien::Package::verbose;
+	$Alien::Package::verbose=2;
+	$this->do("emerge", "--usepkgonly", "--quiet", $file)
+		or die "Unable to install";
+	$Alien::Package::verbose=$v;
+
+	return 1;
 }
 
 =item test
@@ -65,9 +84,23 @@ Test a Gentoo binary package. Pass in the filename.
 
 sub test {
 	my $this=shift;
-	my $file=shift;
+	my $file=shift || $this->filename;
+	return unless defined $file;
 
-	die "TODO: Alien::Package::Gentoo::test not yet implemented; see nlspec/alien-rewrite.md";
+	# Container integrity: verify tar can list the file.
+	$this->do("tar", "-tf", $file)
+		or do { warn "Integrity check failed for '$file'\n"; return; };
+
+	# Metadata sanity: try to extract PF and DESCRIPTION fields.
+	# For .gpkg.tar, scan the package; for .tbz2, check XPAK metadata.
+	my $scanner = Alien::Package::Gentoo->new(filename => $file);
+	unless (defined $scanner->name) {
+		warn "Metadata check failed for '$file': no package name found\n";
+		return;
+	}
+
+	print "OK\n";
+	return 1;
 }
 
 =item scan
@@ -456,8 +489,57 @@ Unpack a Gentoo binary package into a temporary directory.
 sub unpack {
 	my $this=shift;
 	$this->SUPER::unpack(@_);
+	my $file=$this->filename;
 
-	die "TODO: Alien::Package::Gentoo::unpack not yet implemented; see nlspec/alien-rewrite.md";
+	# Set buildtree to a tempdir (absolute path) if not already set.
+	unless ($this->buildtree) {
+		my $dir = tempdir("alien-gentoo-unpack-XXXX",
+			CLEANUP => 1, TMPDIR => 1);
+		$this->buildtree($dir);
+	}
+	my $buildtree=$this->buildtree;
+
+	if ($file =~ /\.gpkg\.tar$/ || $this->_is_gpkg_tar($file)) {
+		# Locate the image.tar.<comp> section member.
+		my $image_member=$this->runpipe(1,
+			"tar -tf '$file' 2>/dev/null | grep '^image\\.tar\\.' | head -1");
+		chomp $image_member;
+		die "No image.tar.* found in .gpkg.tar '$file'"
+			unless $image_member;
+
+		# Determine compression flag from the member name.
+		my $comp_flag='';
+		if    ($image_member =~ /\.gz$/)  { $comp_flag='z'; }
+		elsif ($image_member =~ /\.bz2$/) { $comp_flag='j'; }
+		elsif ($image_member =~ /\.xz$/)  { $comp_flag='J'; }
+		elsif ($image_member =~ /\.zst$/) { $comp_flag='--zstd'; }
+
+		# Step 1: extract image.tar.<comp> member from the outer gpkg.tar
+		# into a staging directory.
+		my $img_tmpdir = tempdir("alien-gpkg-img-XXXX",
+			CLEANUP => 1, TMPDIR => 1);
+		$this->do("tar", "-xf", $file, "-C", $img_tmpdir, $image_member)
+			or die "Cannot extract '$image_member' from '$file'";
+
+		# Step 2: extract the inner tar into buildtree.
+		my $inner_tar = "$img_tmpdir/$image_member";
+		if ($comp_flag eq '--zstd') {
+			$this->do("tar", "--zstd", "-xf", $inner_tar, "-C", $buildtree)
+				or die "Failed to extract image contents from '$file'";
+		}
+		else {
+			$this->do("tar", "-x${comp_flag}f", $inner_tar, "-C", $buildtree)
+				or die "Failed to extract image contents from '$file'";
+		}
+	}
+	else {
+		# .tbz2: the whole file is a bzip2-compressed tar.
+		# tar stops at EOF before the XPAK trailer — harmless.
+		$this->do("tar", "-C", $buildtree, "-xjf", $file)
+			or die "Unpacking of '$file' failed: $!";
+	}
+
+	return $buildtree;
 }
 
 =item prep
@@ -470,7 +552,8 @@ unpacked tree.
 sub prep {
 	my $this=shift;
 
-	die "TODO: Alien::Package::Gentoo::prep not yet implemented; see nlspec/alien-rewrite.md";
+	# Defer to base class behavior.
+	$this->SUPER::prep(@_);
 }
 
 =item build
@@ -739,7 +822,8 @@ had on it.
 sub cleantree {
 	my $this=shift;
 
-	die "TODO: Alien::Package::Gentoo::cleantree not yet implemented; see nlspec/alien-rewrite.md";
+	# Defer to base class.
+	$this->SUPER::cleantree(@_);
 }
 
 =back
